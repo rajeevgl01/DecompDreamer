@@ -1,0 +1,136 @@
+port: 2355
+save_video: true
+seed: 0
+
+PipelineParams:
+  convert_SHs_python: False #true = using direct rgb
+ModelParams:
+  workspace: knight_princess
+  sh_degree: 0
+  bg_aug_ratio: 0.66
+  _source_path: knight_princess
+  _model_path: knight_princess
+
+GuidanceParams:
+  model_key: "stabilityai/stable-diffusion-3.5-medium"
+  wandb_name: 'knight_princess'
+  text: 'A knight in shining armor gallops on a brown horse, wearing a blue hat, holding a sword in his right hand. A princess sits beside him on the same horse, wearing a flowing gown and a jeweled crown, photorealistic, 4K.'
+  prompt_obj: [
+    "A DSLR photo of a sitting knight in a shining armor with his arms in high gaurd stance",
+    "A DSLR photo of a galloping brown horse",
+    "A high quality photo of a blue cap",
+    "A high quality photo of a medieval sword",
+    "A DSLR photo of the Imperial State Crown of England.",
+    "A DSLR photo of a sitting princess, wearing a flowing gown"
+  ]
+  prompt_obj_neg: [
+    "a cap, a sword, a brown horse, arms not in high gaurd stance, no forearms and hands, wearing a helmet",
+    "a knight in shining armor, knight's legs",
+    "The head of knight",
+    "A knight's arm, and hand, no weapon like shape, no sharp blade, very big and thick",
+    "A head of princess",
+    "a knight, a horse, a crown"
+  ]
+  prompt_edge: {
+    "[0, 1]": "A knight galloping a brown horse",
+    "[0, 2]": "A knight wearing a stylish blue cap",
+    "[0, 3]": "A knight holding a medieval sword in his right hand",
+    "[5, 4]": "A princess wearing the imperial state crown of England",
+    "[0, 5]": "A princess sitting beside the knight",
+    "[5, 2]": "A princess galloping a brown horse"
+  }
+  negative: 'ugly, bad anatomy, blurry, pixelated obscure, unnatural colors, poor lighting, dull, and unclear, \
+  cropped, lowres, low quality, artifacts, duplicate, morbid, mutilated, poorly drawn face, deformed, dehydrated, bad proportions'
+  num_objs: 6
+  inverse_text: ''
+  perpneg: true
+  C_batch_size: 4
+  max_t_range: 0.98
+  lambda_guidance: 1.0
+  guidance_scale: 7.5
+  denoise_guidance_scale: 1.0
+  noise_seed: 0
+  use_controlnet: false
+  fp16: true
+
+GenerateCamParams:
+  init_shape: 'mix'
+  init_list: ['ply', 'pointe', 'pointe', 'pointe', 'pointe', 'ply']
+  init_prompt: ['./assets/man1.ply', 'a horse.', 'a cap.', 'a sword.', 'the Imperial State Crown of England.', './assets/man1.ply']
+  rotate_angles: {
+    0: [-1.57, 0.0, 3.14],
+    1: [0, 0, 0],
+    2: [0, 0, 0],
+    3: [0, 0.5, 0],
+    4: [0, 0, 0],
+    5: [-1.57, 0.0, 3.14]
+  }
+  use_pointe_rgb: false
+  init_num_pts: 600_000
+  num_objs: 6
+  center_params: [[0.0, 0.0, 0.28], [0, 0, -0.15], [0.0, 0.035, 0.65], [0.25, 0.1, 0.4], [0.0, -0.165, 0.65], [0.0, -0.2, 0.28]]
+  radius_params: [0.6, 0.9, 0.1, 0.2, 0.1, 0.6]
+  phi_range: [-180, 180]
+  max_phi_range: [-180, 180]
+  rand_cam_gamma: 1.5
+  image_w: 512
+  image_h: 512
+
+  theta_range: [45, 90]
+  max_theta_range: [45, 90]
+
+  radius_range: [5.2, 5.5] #[3.8, 4.5] #[3.0, 3.5]
+  max_radius_range: [3.5, 5.0] #[3.8, 4.5] #[3.0, 3.5]
+  default_radius: 3.5
+ 
+  default_fovy: 0.55
+  fovy_range: [0.32, 0.60]
+  max_fovy_range: [0.16, 0.60]
+
+OptimizationParams:
+  iterations: 9000
+  save_process: True
+  pro_frames_num: 600
+  pro_render_45: False
+  warmup_iter: 2700 # 2500
+  num_objs: 6
+  azimuth_offsets: {
+    '0': 0,
+    '1': 0,
+    '2': 0,
+    '3': 0,
+    '4': 0,
+    '5': 0,
+    "[0, 1]": 0,
+    "[0, 2]": 0,
+    "[0, 3]": 0,
+    "[5, 4]": 0,
+    "[0, 5]": 0,
+    "[5, 2]": 0,
+    'global': 0
+  }
+  edge_list: [[0, 1], [0, 2], [0, 3], [5, 4], [0, 5], [5, 2]]
+  size_lambda: 10
+  edge_weight: {
+    '[0, 1]': 1,
+    '[0, 2]': 1,
+    '[0, 3]': 1,
+    '[5, 4]': 1,
+    '[0, 5]': 1,
+    '[5, 2]': 1
+  }
+  geo_iter : 0
+  densify_from_iter: 600
+  densification_interval: 600
+  densify_until_iter: 5400
+  percent_dense: 0.003
+  densify_grad_threshold: 0.00075
+  progressive_view_iter: 900 #1500
+  opacity_reset_interval: 1800 #500
+  scene_iter_1: 1
+  scene_iter_2: 0
+  stage_2_iters: 5400
+
+  scale_up_cameras_iter: 900
+  fovy_scale_up_factor: [0.75, 1.1]
+  phi_scale_up_factor: 1.5
