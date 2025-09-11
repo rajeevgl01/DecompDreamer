@@ -233,7 +233,7 @@ class StableDiffusion(nn.Module):
         grad = sigma * (pred_noise - target)
 
         grad = torch.nan_to_num(grad_scale * grad)
-        loss = SpecifyGradient.apply(target, grad)
+        loss = SpecifyGradient.apply(latents, grad)
         return loss
 
     def encode_imgs(self, images):

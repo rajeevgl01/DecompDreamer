@@ -152,10 +152,12 @@ class OptimizationParams(ParamGroup):
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.0050
+        self.feature_lr = 0.0025
         self.feature_lr_final = 0.0030
+        self.pos_delta_lr_init = 0.0079
+        self.pos_delta_lr_final = 0.000016
 
-        self.opacity_lr = 0.05
+        self.opacity_lr = 0.025
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
 
@@ -218,7 +220,7 @@ class GenerateCamParams(ParamGroup):
         self.max_fovy_range = [0.16, 0.60]
         self.rand_cam_gamma = 1.0
         self.angle_overhead = 30
-        self.angle_front =60
+        self.angle_front = 60
         self.render_45 = True
         self.uniform_sphere_rate = 0
         self.image_w = 512

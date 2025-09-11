@@ -13,7 +13,7 @@ import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks,GenerateRandomCameras,GeneratePurnCameras,GenerateCircleCameras, GenerateCameraAtZeroAzimuth
+from scene.dataset_readers import sceneLoadTypeCallbacks,GenerateRandomCameras,GeneratePurnCameras,GenerateCircleCameras, GenerateCameraAtZeroAzimuth, GenerateSphericalCameras
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams, GenerateCamParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, cameraList_from_RcamInfos
@@ -73,8 +73,14 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
-    def getRandTrainCameras(self, scale=1.0):
-        rand_train_cameras = GenerateRandomCameras(self.pose_args, self.args.batch, SSAA=True)
+    # def getRandTrainCameras(self, cam_scale=1.0, scale=1.0):
+    #     rand_train_cameras, forward_vector = GenerateRandomCameras(self.pose_args, self.args.batch, cam_scale, SSAA=True)
+    #     train_cameras = {}
+    #     for resolution_scale in self.resolution_scales:
+    #         train_cameras[resolution_scale] = cameraList_from_RcamInfos(rand_train_cameras, resolution_scale, self.pose_args, SSAA=True)        
+    #     return train_cameras[scale], forward_vector.tolist()
+    def getRandTrainCameras(self, cam_scale=1.0, scale=1.0):
+        rand_train_cameras = GenerateRandomCameras(self.pose_args, self.args.batch, cam_scale, SSAA=True)
         train_cameras = {}
         for resolution_scale in self.resolution_scales:
             train_cameras[resolution_scale] = cameraList_from_RcamInfos(rand_train_cameras, resolution_scale, self.pose_args, SSAA=True)        
@@ -87,14 +93,42 @@ class Scene:
             train_cameras[resolution_scale] = cameraList_from_RcamInfos(rand_train_cameras, resolution_scale, self.pose_args, SSAA=True)        
         return train_cameras[scale]
 
+    def getCameraAtZeroAzimuthTrellis(self, scale=1.0):
+        self.pose_args.radius_range = [2, 2]
+        rand_train_cameras = GenerateCameraAtZeroAzimuth(self.pose_args, SSAA=True)
+        train_cameras = {}
+        for resolution_scale in self.resolution_scales:
+            train_cameras[resolution_scale] = cameraList_from_RcamInfos(rand_train_cameras, resolution_scale, self.pose_args, SSAA=True)        
+        return train_cameras[scale]
+
     def getPurnTrainCameras(self, scale=1.0):
         rand_train_cameras = GeneratePurnCameras(self.pose_args)
         train_cameras = {}
         for resolution_scale in self.resolution_scales:
             train_cameras[resolution_scale] = cameraList_from_RcamInfos(rand_train_cameras, resolution_scale, self.pose_args)        
         return train_cameras[scale]
+    
+    def getTrellisCamera(self, obj_azimuth_offset={}, edge_azimuth_offset={}):
+        rand_train_cameras = GenerateSphericalCameras(
+            opt=self.pose_args,
+            size=150,
+            obj_azimuth_adjustments=obj_azimuth_offset,
+            edge_azimuth_adjustments=edge_azimuth_offset,
+            SSAA=True
+        )
+        train_cameras = {}
+        for obj_idx, obj_cameras in rand_train_cameras['objects'].items():
+            train_cameras[obj_idx] = {}
+            for key, cameras in obj_cameras.items():
+                train_cameras[obj_idx][key] = cameraList_from_RcamInfos(cameras, 1.0, self.pose_args)
 
+        for edge_idx, edge_cameras in rand_train_cameras['edges'].items():
+            train_cameras[edge_idx] = {}
+            for key, cameras in edge_cameras.items():
+                train_cameras[edge_idx][key] = cameraList_from_RcamInfos(cameras, 1.0, self.pose_args)
 
+        return train_cameras
+        
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
 

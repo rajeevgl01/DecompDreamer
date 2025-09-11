@@ -165,9 +165,16 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 			print('scale up phi_range to:', scene.pose_args.phi_range)
 			print('scale up fovy_range to:', scene.pose_args.fovy_range)
 	
+	if len(objs) == 1:
+		cam_scale = gcams.radius_params[objs[0]]
+	elif len(objs) == 2:
+		cam_scale = max(gcams.radius_params[objs[0]], gcams.radius_params[objs[1]])
+	else:
+		cam_scale = 1.0
+
 	# Pick a random Camera
 	if not viewpoint_stack:
-		viewpoint_stack = scene.getRandTrainCameras().copy()
+		viewpoint_stack = scene.getRandTrainCameras(cam_scale).copy()
 
 	C_batch_size = guidance_opt.C_batch_size
 	viewpoint_cams = []
@@ -181,7 +188,7 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 		try:
 			viewpoint_cam = viewpoint_stack.pop()
 		except:
-			viewpoint_stack = scene.getRandTrainCameras().copy()
+			viewpoint_stack = scene.getRandTrainCameras(cam_scale).copy()
 			viewpoint_cam = viewpoint_stack.pop()
 
 		# Predict text embeddings
@@ -226,12 +233,17 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 							sh_deg_aug_ratio=dataset.sh_deg_aug_ratio,
 							bg_aug_ratio=dataset.bg_aug_ratio,
 							shs_aug_ratio=dataset.shs_aug_ratio,
-							scale_aug_ratio=dataset.scale_aug_ratio)
+							scale_aug_ratio=dataset.scale_aug_ratio,
+							scaling_modifier=cam_scale)
 		image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[
 			"viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
 		scales.append(render_pkg["scales"])
 		images.append(image)
+		# to_pil = T.ToPILImage()
+		# save = to_pil(image)
+		# save.save(f"out_{iteration}_{i}_{len(objs)}_without.png")
+		
 		viewpoint_cams.append(viewpoint_cams)
 
 	images = torch.stack(images, dim=0)
@@ -451,11 +463,9 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 					obj_loss, _, viewspace_point_tensor_obj, visibility_filter_obj, radii_obj = forward(opt,
 																										embeddings=obj_embeddings[obj], objs=[obj], azimuth_offset=azimuth_offsets[str(obj)], **kwargs)
 					if opt.size_lambda:
-						reference_volume = torch.tensor(gt_volumes[obj]).to('cuda').detach()
-						size_loss = F.mse_loss(gaussians.get_object_volume(obj), reference_volume) / reference_volume
+						size_loss = gaussians.get_volume_loss(obj, gt_volumes[obj])
 						wandb.log({"loss/obj_size_loss": size_loss.item()})
-						loss += obj_weight * obj_loss + opt.size_lambda * (1 - (iteration // num_objs) / (opt.iterations // num_objs)) * size_loss
-						# loss += obj_loss + opt.size_lambda * (1 - (iteration // num_objs) / (opt.iterations // num_objs)) * size_loss
+						loss += obj_weight * obj_loss + float(opt.size_lambda) * (1 - (iteration // num_objs) / (opt.iterations // num_objs)) * size_loss
 					else:
 						loss += obj_weight * obj_loss
 					selected_objs += [[obj]]
@@ -486,8 +496,14 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 				radiis = [radii]
 				obj_loss, _, viewspace_point_tensor_obj, visibility_filter_obj, radii_obj = forward(opt,
 																									embeddings=obj_embeddings[obj], objs=[
-																										obj], azimuth_offset=azimuth_offsets[str(obj)], **kwargs)
-				loss += obj_loss
+																										obj], azimuth_offset=azimuth_offsets[str(obj)], **kwargs)																										
+				if opt.size_lambda and opt.num_objs == 6:
+					size_loss = gaussians.get_volume_loss(obj, gt_volumes[obj])
+					wandb.log({"loss/obj_size_loss": size_loss.item()})
+					loss += obj_loss + float(opt.size_lambda) * (1 - (iteration // num_objs) / (opt.iterations // num_objs)) * size_loss
+				else:
+					loss += obj_loss
+				# loss += obj_loss
 				selected_objs += [[obj]]
 				vpt += [viewspace_point_tensor_obj]
 				vf += [visibility_filter_obj]
@@ -533,6 +549,7 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 			training_report(tb_writer, iteration, iter_start.elapsed_time(
 				iter_end), testing_iterations, scene, render, (pipe, background, idx_list))
 			if (iteration in testing_iterations):
+				idx_list = [1, 2]
 				if save_video:
 					video_inference(iteration, scene, render,
 									(pipe, background, idx_list), tb_writer)
@@ -575,6 +592,9 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 			if iteration < opt.iterations:
 				gaussians.optimizer.step()
 				gaussians.optimizer.zero_grad(set_to_none=True)
+			
+			if stage == 2 and operation == 'edge':
+				gaussians.reinit_from_state_dict(previous_state, obj)
 
 			if (iteration in checkpoint_iterations):
 				print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -727,7 +747,7 @@ if __name__ == "__main__":
 	parser.add_argument('--debug_from', type=int, default=-1)
 	parser.add_argument('--seed', type=int, default=0)
 	parser.add_argument('--detect_anomaly', action='store_true', default=False)
-	parser.add_argument("--test_ratio", type=int, default=20)
+	parser.add_argument("--test_ratio", type=int, default=50)
 	parser.add_argument("--save_ratio", type=int, default=2)
 	parser.add_argument("--save_video", type=bool, default=False)
 	parser.add_argument("--quiet", action="store_true")

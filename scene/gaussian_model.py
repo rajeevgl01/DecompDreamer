@@ -62,6 +62,7 @@ class GaussianModel:
 		self.setup_functions()
 
 	def capture(self):
+		# print(self.pos_delta)
 		return (
 			self.active_sh_degree,
 			self._xyz,
@@ -96,7 +97,7 @@ class GaussianModel:
 		self.xyz_gradient_accum = xyz_gradient_accum
 		self.denom = denom
 		self.points_per_obj = points_per_obj.tolist()
-		# self.optimizer.load_state_dict(opt_dict)
+		self.optimizer.load_state_dict(opt_dict)
 
 	@property
 	def get_scaling(self):
@@ -110,9 +111,9 @@ class GaussianModel:
 	def get_xyz(self):
 		return self._xyz
 	
-	@property
-	def get_pos_delta(self):
-		return self.pos_delta
+	# @property
+	# def get_pos_delta(self):
+	# 	return self.pos_delta
 
 	@property
 	def get_background(self):
@@ -138,6 +139,16 @@ class GaussianModel:
 	def oneupSHdegree(self):
 		if self.active_sh_degree < self.max_sh_degree:
 			self.active_sh_degree += 1
+		
+	def freeze_params(self):
+		self._xyz.requires_grad = False
+		self._features_dc.requires_grad = False
+		self._features_rest.requires_grad = False
+		self._scaling.requires_grad = False
+		self._rotation.requires_grad = False
+		self._opacity.requires_grad = False
+		self._background.requires_grad = False
+		self.max_radii2D.requires_grad = False
 
 	def create_from_pcd(self, pcd : BasicPointCloud, points_per_obj: list, spatial_lr_scale : float, num_objs: int):
 		self.spatial_lr_scale = spatial_lr_scale
@@ -183,17 +194,12 @@ class GaussianModel:
 			{'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
 			{'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
 			{'params': [self._background], 'lr': training_args.feature_lr, "name": "background"},
-			# {'params': [self.pos_delta], 'lr': training_args.position_lr_init, "name": "pos_delta"}
+			# {'params': [self.pos_delta], 'lr': training_args.pos_delta_lr_init, "name": "pos_delta"}
 		]
 		
 		self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 		self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
 													lr_final=training_args.position_lr_final*self.spatial_lr_scale,
-													lr_delay_mult=training_args.position_lr_delay_mult,
-													max_steps=training_args.iterations)
-
-		self.pos_delta_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init,
-													lr_final=training_args.position_lr_final,
 													lr_delay_mult=training_args.position_lr_delay_mult,
 													max_steps=training_args.iterations)
 
@@ -211,6 +217,12 @@ class GaussianModel:
 													lr_final=training_args.feature_lr_final,
 													lr_delay_mult=training_args.position_lr_delay_mult,
 													max_steps=training_args.iterations)
+
+		# self.pos_delta_scheduler_args = get_expon_lr_func(lr_init=training_args.pos_delta_lr_init,
+		# 											lr_final=training_args.pos_delta_lr_final,
+		# 											lr_delay_mult=training_args.position_lr_delay_mult,
+		# 											max_steps=training_args.iterations)
+
 	def update_learning_rate(self, iteration):
 		''' Learning rate scheduling per step '''
 		for param_group in self.optimizer.param_groups:
@@ -219,13 +231,13 @@ class GaussianModel:
 				param_group['lr'] = lr
 				return lr
 
-	def update_pos_delta_learning_rate(self, iteration):
-		''' Learning rate scheduling per step '''
-		for param_group in self.optimizer.param_groups:
-			if param_group["name"] == "pos_delta":
-				lr = self.xyz_scheduler_args(iteration)
-				param_group['lr'] = lr
-				return lr
+	# def update_pos_delta_learning_rate(self, iteration):
+	# 	''' Learning rate scheduling per step '''
+	# 	for param_group in self.optimizer.param_groups:
+	# 		if param_group["name"] == "pos_delta":
+	# 			lr = self.pos_delta_scheduler_args(iteration)
+	# 			param_group['lr'] = lr
+	# 			return lr
 
 	def update_feature_learning_rate(self, iteration):
 		''' Learning rate scheduling per step '''
@@ -592,12 +604,24 @@ class GaussianModel:
 			self.xyz_gradient_accum[i, :self.points_per_obj[i]][update_filter[j][:self.points_per_obj[i]]] += torch.norm(viewspace_point_tensor.grad[i, :self.points_per_obj[i]][update_filter[j][:self.points_per_obj[i]],:2], dim=-1, keepdim=True)
 			self.denom[i, :self.points_per_obj[i]][update_filter[j][:self.points_per_obj[i]]] += 1
 	
-	def get_object_volume(self, obj):
+	def get_volume_loss(self, obj, reference_volume):
+		relu = nn.ReLU()
 		points = self._xyz[obj, :self.points_per_obj[obj]]
-		min_vals, max_vals = points.min(dim=0).values, points.max(dim=0).values
-		length, width, height = torch.abs(max_vals - min_vals)
-		volume = length * width * height
-		return volume
+		loss = 0
+		x_max = reference_volume[0] / 2
+		y_max = reference_volume[1] / 2
+		z_max = reference_volume[2] / 2
+
+		x_min = -reference_volume[0] / 2
+		y_min = -reference_volume[1] / 2
+		z_min = -reference_volume[2] / 2
+
+		bounds = [x_min, y_min, z_min, x_max, y_max, z_max]
+		for j in range(len(bounds)):
+			sign = 1 if j // 3 == 0 else -1
+			loss += relu((torch.tensor(bounds[j], dtype=torch.float, device="cuda") - points[:, j % 3]) * sign).sum()
+		
+		return loss
 	
 	def concatenate_reinit_tensors(self, tensor):
 		temp = []
@@ -658,7 +682,7 @@ class GaussianModel:
 		new_opacities = []
 		new_scaling = []
 		new_rotation = []
-		new_points_per_obj = []
+		# new_pos_delta = []
 
 		(active_sh_degree, 
 		_xyz, 
@@ -683,7 +707,7 @@ class GaussianModel:
 				new_opacities.append(_opacity[i, :points_per_obj[i]])
 				new_scaling.append(_scaling[i, :points_per_obj[i]])
 				new_rotation.append(_rotation[i, :points_per_obj[i]])
-				self.points_per_obj[i] = points_per_obj[i]
+				# self.pos_delta[i] = pos_delta[i]
 			else:
 				new_xyz.append(self._xyz[i, :self.points_per_obj[i]])
 				new_features_dc.append(self._features_dc[i, :self.points_per_obj[i]])
@@ -693,5 +717,3 @@ class GaussianModel:
 				new_rotation.append(self._rotation[i, :self.points_per_obj[i]])
 
 		self.reinit_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
-
-

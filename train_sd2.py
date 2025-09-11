@@ -288,7 +288,7 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 	wandb.tensorboard.patch(str(dataset._model_path))
 	timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 	wandb.init(
-		project="graph_lucid",
+		project="decompdreamer_sd2",
 		name=f"{guidance_opt.wandb_name}_{timestamp}",
 		sync_tensorboard=True,
 		config=cfg,

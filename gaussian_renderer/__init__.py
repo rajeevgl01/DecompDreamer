@@ -18,6 +18,7 @@ from utils.sh_utils import eval_sh, SH2RGB
 from utils.graphics_utils import fov2focal
 import random
 
+
 def zero_pad_tensor(tensor_list, pad_size, num_objs):
     x = list(tensor_list[0].shape)
     x[0] = pad_size
@@ -31,7 +32,7 @@ def zero_pad_tensor(tensor_list, pad_size, num_objs):
 
 
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, objs: list, scaling_modifier=1.0, black_video=False,
-           override_color=None, sh_deg_aug_ratio=0.1, bg_aug_ratio=0.3, shs_aug_ratio=1.0, scale_aug_ratio=1.0, test=False):
+           override_color=None, sh_deg_aug_ratio=0.1, bg_aug_ratio=0.3, shs_aug_ratio=1.0, scale_aug_ratio=1.0, object_scale=1.0, test=False):
     """
     Render the scene. 
 
@@ -47,31 +48,32 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, ob
     except:
         pass
 
-    if black_video:
-        bg_color = torch.zeros_like(bg_color)
+    # if black_video:
+    #     bg_color = torch.zeros_like(bg_color)
     # Aug
     if random.random() < sh_deg_aug_ratio and not test:
         act_SH = 0
     else:
         act_SH = pc.active_sh_degree
 
-    if random.random() < bg_aug_ratio and not test:
-        if random.random() < 0.5:
-            bg_color = torch.rand_like(bg_color)
-        else:
-            bg_color = torch.zeros_like(bg_color)
-        # bg_color = torch.zeros_like(bg_color)
+    # if random.random() < bg_aug_ratio and not test:
+    #     if random.random() < 0.5:
+    #         bg_color = torch.rand_like(bg_color)
+    #     else:
+    #         bg_color = torch.zeros_like(bg_color)
 
-    # bg_color = torch.zeros_like(bg_color)
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
     try:
         raster_settings = GaussianRasterizationSettings(
             image_height=int(viewpoint_camera.image_height),
             image_width=int(viewpoint_camera.image_width),
             tanfovx=tanfovx,
             tanfovy=tanfovy,
+            kernel_size=0.1,
+            subpixel_offset=subpixel_offset,
             bg=bg_color,
             scale_modifier=scaling_modifier,
             viewmatrix=viewpoint_camera.world_view_transform,
@@ -86,6 +88,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, ob
             image_width=int(viewpoint_camera.image_width),
             tanfovx=tanfovx,
             tanfovy=tanfovy,
+            kernel_size=0.1,
+            subpixel_offset=subpixel_offset,
             bg=bg_color,
             scale_modifier=scaling_modifier,
             viewmatrix=viewpoint_camera.world_view_transform,
@@ -98,18 +102,26 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, ob
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = []
-    means2D = []
-    opacity = []
+    means3D_list = []
+    means2D_list = []
+    opacity_list = []
 
+    # Collect 3D means, 2D projections, and opacities for each object
     for i in objs:
-        means3D.append(pc.get_xyz[i][:pc.points_per_obj[i]])
-        means2D.append(screenspace_points[i][:pc.points_per_obj[i]])
-        opacity.append(pc.get_opacity[i][:pc.points_per_obj[i]])
+        n_points = pc.points_per_obj[i]
+        means3D_list.append(pc.get_xyz[i][:n_points])
+        means2D_list.append(screenspace_points[i][:n_points])
+        opacity_list.append(pc.get_opacity[i][:n_points])
 
-    means3D = torch.cat(means3D, dim=0)
-    means2D = torch.cat(means2D, dim=0)
-    opacity = torch.cat(opacity, dim=0)
+    # Concatenate all object data
+    means3D = torch.cat(means3D_list, dim=0)
+    means2D = torch.cat(means2D_list, dim=0)
+    opacity = torch.cat(opacity_list, dim=0)
+
+    # Center 3D means around origin
+    shift_to_origin = means3D.mean(dim=0, keepdim=True).detach()
+    means3D = means3D - shift_to_origin
+    # means3D = means3D / object_scale
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -128,6 +140,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, ob
                 pc.get_rotation[i][:pc.points_per_obj[i]].reshape(-1, 4))
         scales = torch.cat(scales, dim=0)
         rotations = torch.cat(rotations, dim=0)
+    
+    # scales = scales * object_scale
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -234,12 +248,15 @@ def render_obj(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
     try:
         raster_settings = GaussianRasterizationSettings(
             image_height=int(viewpoint_camera.image_height),
             image_width=int(viewpoint_camera.image_width),
             tanfovx=tanfovx,
             tanfovy=tanfovy,
+            kernel_size=0.1,
+            subpixel_offset=subpixel_offset,
             bg=bg_color,
             scale_modifier=scaling_modifier,
             viewmatrix=viewpoint_camera.world_view_transform,
@@ -254,6 +271,8 @@ def render_obj(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
             image_width=int(viewpoint_camera.image_width),
             tanfovx=tanfovx,
             tanfovy=tanfovy,
+            kernel_size=0.1,
+            subpixel_offset=subpixel_offset,
             bg=bg_color,
             scale_modifier=scaling_modifier,
             viewmatrix=viewpoint_camera.world_view_transform,
@@ -270,11 +289,13 @@ def render_obj(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
     means2D = []
     opacity = []
 
-    means3D.append(pc.get_xyz[obj][:pc.points_per_obj[obj]])
+    shift_to_origin = pc.get_xyz[obj][:pc.points_per_obj[obj]]
+    means3D.append(pc.get_xyz[obj][:pc.points_per_obj[obj]] -
+                   shift_to_origin.mean(dim=0, keepdim=True).detach())
     means2D.append(screenspace_points[obj][:pc.points_per_obj[obj]])
     opacity.append(pc.get_opacity[obj][:pc.points_per_obj[obj]])
-
     means3D = torch.cat(means3D, dim=0)
+    # means3D = means3D / 0.15
     means2D = torch.cat(means2D, dim=0)
     opacity = torch.cat(opacity, dim=0)
 
@@ -311,6 +332,137 @@ def render_obj(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
             shs.append(pc.get_features[obj][:pc.points_per_obj[obj]
                                             ].reshape(-1, (pc.max_sh_degree + 1) ** 2, 3))
             shs = torch.cat(shs, dim=0)
+    else:
+        colors_precomp = override_color
+
+    if random.random() < shs_aug_ratio and not test:
+        variance = (0.2 ** 0.5) * shs
+        shs = shs + (torch.randn_like(shs) * variance)
+
+    # add noise to scales
+    if random.random() < scale_aug_ratio and not test:
+        variance = (0.2 ** 0.5) * scales / 4
+        scales = torch.clamp(
+            scales + (torch.randn_like(scales) * variance), 0.0)
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    rendered_image, radii = rasterizer(
+        means3D=means3D,
+        means2D=means2D,
+        shs=shs,
+        colors_precomp=colors_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp)
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return {"render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter": radii > 0,
+            "radii": radii,
+            "scales": scales}
+
+def render_trellis(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0, black_video=False,
+               override_color=None, sh_deg_aug_ratio=0.1, bg_aug_ratio=0.3, shs_aug_ratio=1.0, scale_aug_ratio=1.0, test=False):
+    """
+    Render the scene. 
+
+    Background tensor (bg_color) must be on GPU!
+    """
+    # for i in range(4):
+    #     print(pc.get_xyz[i].isnan().sum())
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(
+        pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # if black_video:
+    #     bg_color = torch.zeros_like(bg_color)
+    # Aug
+    if random.random() < sh_deg_aug_ratio and not test:
+        act_SH = 0
+    else:
+        act_SH = pc.active_sh_degree
+
+    # if random.random() < bg_aug_ratio and not test:
+    #     if random.random() < 0.5:
+    #         bg_color = torch.rand_like(bg_color)
+    #     else:
+    #         bg_color = torch.zeros_like(bg_color)
+        # bg_color = torch.zeros_like(bg_color)
+
+    # bg_color = torch.zeros_like(bg_color)
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
+    try:
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            kernel_size=0.1,
+            subpixel_offset=subpixel_offset,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            sh_degree=act_SH,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False
+        )
+    except TypeError as e:
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            kernel_size=0.1,
+            subpixel_offset=subpixel_offset,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform,
+            sh_degree=act_SH,
+            campos=viewpoint_camera.camera_center,
+            prefiltered=False,
+            debug=False
+        )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    opacity = pc.get_opacity
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3D_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling
+        rotations = pc.get_rotation
+
+    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    shs = None
+    colors_precomp = None
+    if colors_precomp is None:
+        if pipe.convert_SHs_python:
+            raw_rgb = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2).squeeze()[:,:3]
+            rgb = torch.sigmoid(raw_rgb)
+            colors_precomp = rgb
+        else:
+            shs = pc.get_features
     else:
         colors_precomp = override_color
 

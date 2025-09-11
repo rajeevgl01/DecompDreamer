@@ -1,0 +1,1 @@
+Namespace(sh_degree=0, _source_path='./knight_horse_4/', _model_path='./knight_horse_4/', pretrained_model_path=None, _images='images', workspace='knight_horse', batch=4, _resolution=-1, _white_background=True, data_device='cuda', eval=False, opt_path='configs/knight_horse.yaml', sh_deg_aug_ratio=0.1, bg_aug_ratio=0.66, shs_aug_ratio=0.0, scale_aug_ratio=1.0)

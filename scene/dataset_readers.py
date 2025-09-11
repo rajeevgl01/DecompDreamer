@@ -77,8 +77,34 @@ def loadPly(path, num_points):
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
 
-    points = np.random.choice(positions.shape[0], num_points, replace=False)
-    return positions[points]
+    # Center and scale to unit sphere
+    positions = positions - positions.mean(axis=0)
+    max_norm = np.max(np.linalg.norm(positions, axis=1))
+    if max_norm > 0:
+        positions = positions / max_norm  # normalize to unit radius
+
+    n_pts = positions.shape[0]
+
+    if n_pts >= num_points:
+        indices = np.random.choice(n_pts, num_points, replace=False)
+        return positions[indices]
+    else:
+        # Need to upsample: duplicate + jitter in small sphere
+        repeat_times = int(np.ceil(num_points / n_pts))
+        positions_tiled = np.tile(positions, (repeat_times, 1))[:num_points]
+
+        # Jitter points in a small sphere
+        thetas = np.random.rand(num_points) * np.pi
+        phis = np.random.rand(num_points) * 2 * np.pi
+        radius = np.random.rand(num_points) * 0.05
+
+        jitter = np.stack([
+            radius * np.sin(thetas) * np.sin(phis),
+            radius * np.sin(thetas) * np.cos(phis),
+            radius * np.cos(thetas),
+        ], axis=-1)
+
+        return (positions_tiled + jitter)
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -205,7 +231,7 @@ def readCircleCamInfo(path, opt):
                 x_min, y_min, z_min = np.min(obj_xyz, axis=0)
                 x_max, y_max, z_max = np.max(obj_xyz, axis=0)
                 x_val, y_val, z_val = np.abs([x_max - x_min, y_max - y_min, z_max - z_min])
-                volume = x_val * y_val * z_val
+                volume = [x_val, y_val, z_val]
                 xyz.append(obj_xyz)
                 rgb.append(obj_rgb)
                 lengths.append(num_pts)
@@ -253,7 +279,7 @@ def readCircleCamInfo(path, opt):
                 x_min, y_min, z_min = np.min(obj_xyz, axis=0)
                 x_max, y_max, z_max = np.max(obj_xyz, axis=0)
                 x_val, y_val, z_val = np.abs([x_max - x_min, y_max - y_min, z_max - z_min])
-                volume = x_val * y_val * z_val
+                volume = [x_val, y_val, z_val]
                 xyz.append(obj_xyz)
                 rgb.append(obj_rgb)
                 lengths.append(num_pts)
@@ -305,8 +331,6 @@ def readCircleCamInfo(path, opt):
                                 test_cameras=test_cam_infos,
                                 ply_path=ply_path)
     return scene_info
-# borrow from https://github.com/ashawkey/stable-dreamfusion
-
 
 def safe_normalize(x, eps=1e-20):
     return x / torch.sqrt(torch.clamp(torch.sum(x * x, -1, keepdim=True), min=eps))
@@ -563,19 +587,47 @@ def GenerateCircleCameras(opt, size=8, render45=False):
     return cam_infos
 
 
-def GenerateRandomCameras(opt, size=2000, SSAA=True):
+def get_dynamic_fovy_range(fovy_range, cam_scale):
+    # Reference points
+    x1, x2 = 0.1, 1.0
+    y1 = [1.46, 1.98]     # FOV at smallest scale
+    y2 = fovy_range       # FOV at default scale
+
+    # Compute slopes and intercepts
+    m_min = (y2[0] - y1[0]) / (x2 - x1)
+    m_max = (y2[1] - y1[1]) / (x2 - x1)
+
+    b_min = y1[0] - m_min * x1
+    b_max = y1[1] - m_max * x1
+
+    # Interpolate for current scale
+    min_fov = m_min * cam_scale + b_min
+    max_fov = m_max * cam_scale + b_max
+
+    return [round(min_fov, 4), round(max_fov, 4)]
+
+
+def GenerateRandomCameras(opt, size=2000, cam_scale=1.0, SSAA=True):
     # random pose on the fly
     poses, thetas, phis, radius = rand_poses_orthogonal(size, opt, radius_range=opt.radius_range, theta_range=opt.theta_range, phi_range=opt.phi_range,
                                              angle_overhead=opt.angle_overhead, angle_front=opt.angle_front, uniform_sphere_rate=opt.uniform_sphere_rate,
                                              rand_cam_gamma=opt.rand_cam_gamma)
+    # poses, thetas, phis, radius = rand_poses_orthogonal(size, opt, radius_range=[x * cam_scale for x in opt.radius_range], theta_range=opt.theta_range, phi_range=opt.phi_range,
+    #                                          angle_overhead=opt.angle_overhead, angle_front=opt.angle_front, uniform_sphere_rate=opt.uniform_sphere_rate,
+    #                                          rand_cam_gamma=opt.rand_cam_gamma)
     # delta polar/azimuth/radius to default view
     delta_polar = thetas - opt.default_polar
     delta_azimuth = phis - opt.default_azimuth
     delta_azimuth[delta_azimuth > 180] -= 360  # range in [-180, 180]
-    delta_radius = radius - opt.default_radius
+    delta_radius = radius - opt.default_radius * cam_scale
+    # print(radius, delta_radius, opt.radius_range, [x * cam_scale for x in opt.radius_range])
     # random focal
+    # fovy_range = get_dynamic_fovy_range(opt.fovy_range, cam_scale)
+    # fov = random.random() * (fovy_range[1] - fovy_range[0]) + fovy_range[0]
+
     fov = random.random() * \
         (opt.fovy_range[1] - opt.fovy_range[0]) + opt.fovy_range[0]
+
 
     cam_infos = []
 
@@ -605,7 +657,7 @@ def GenerateRandomCameras(opt, size=2000, SSAA=True):
 def GenerateCameraAtZeroAzimuth(opt, SSAA=True):
     # Generate a single pose at 0-degree azimuth
     size = 4  # Only one camera
-    fixed_azimuth = 0  # Azimuth at 0 degrees
+    fixed_azimuth = 90  # Azimuth at 0 degrees
     
     # Generate a pose with fixed azimuth
     poses, thetas, phis, radius = rand_poses_orthogonal(
@@ -678,6 +730,163 @@ def GeneratePurnCameras(opt, size=300):
                                         height=opt.image_h, delta_polar=delta_polar[idx], delta_azimuth=delta_azimuth[idx], delta_radius=delta_radius[idx]))
     return cam_infos
 
+def GenerateSphericalCameras(opt, size=150, obj_azimuth_adjustments=None, edge_azimuth_adjustments=None, SSAA=True):
+    """
+    Generate cameras using spherical Hammersley sequence with different radius parameters
+    and azimuth adjustments for objects and edges.
+    
+    Args:
+        opt: Options containing camera parameters
+        size: Number of base cameras to generate (default 150)
+        radius_params: List of fixed radius values to use
+        obj_azimuth_adjustments: Dict {obj_idx: azimuth_offset} for objects
+        edge_azimuth_adjustments: Dict {edge_idx: azimuth_offset} for edges
+        SSAA: Whether to apply super sampling
+    
+    Returns:
+        Dictionary containing different camera sets
+    """
+    from dataset_toolkits.utils import sphere_hammersley_sequence
+
+    if obj_azimuth_adjustments is None:
+        obj_azimuth_adjustments = {}
+        
+    if edge_azimuth_adjustments is None:
+        edge_azimuth_adjustments = {}
+    
+    # SSAA settings
+    if SSAA:
+        ssaa = opt.SSAA
+    else:
+        ssaa = 1
+    
+    image_h = opt.image_h * ssaa
+    image_w = opt.image_w * ssaa
+    
+    # Random focal length
+    fov = random.random() * (opt.fovy_range[1] - opt.fovy_range[0]) + opt.fovy_range[0]
+    
+    def create_camera_from_spherical(phi, theta, radius, uid_offset=0, azimuth_adjustment=0):
+        """Create camera info from spherical coordinates"""
+        # Adjust azimuth
+        phi_adjusted = phi + np.radians(azimuth_adjustment)
+        
+        # Convert spherical to Cartesian
+        x = radius * np.cos(theta) * np.cos(phi_adjusted)
+        y = radius * np.cos(theta) * np.sin(phi_adjusted)
+        z = radius * np.sin(theta)
+        
+        # Create pose matrix
+        center = torch.tensor([x, y, z], dtype=torch.float32)
+        target = torch.zeros(3, dtype=torch.float32)
+        
+        # Look-at vectors
+        forward_vector = safe_normalize((center - target).unsqueeze(0))
+        up_vector = torch.tensor([[0, 0, 1]], dtype=torch.float32)
+        right_vector = safe_normalize(torch.cross(forward_vector, up_vector, dim=-1))
+        up_vector = safe_normalize(torch.cross(right_vector, forward_vector, dim=-1))
+        
+        # Create pose matrix
+        pose = torch.eye(4, dtype=torch.float32)
+        pose[:3, :3] = torch.stack([-right_vector[0], up_vector[0], forward_vector[0]], dim=-1)
+        pose[:3, 3] = center
+        
+        # Convert to camera parameters
+        matrix = np.linalg.inv(pose.numpy())
+        R = -np.transpose(matrix[:3, :3])
+        R[:, 0] = -R[:, 0]
+        T = -matrix[:3, 3]
+        
+        # Calculate FOV
+        fovy = focal2fov(fov2focal(fov, image_h), image_w)
+        FovY = fovy
+        FovX = fov
+        
+        # Calculate deltas for compatibility
+        theta_deg = np.degrees(theta)
+        phi_deg = np.degrees(phi_adjusted)
+        
+        delta_polar = theta_deg - opt.default_polar
+        delta_azimuth = phi_deg - opt.default_azimuth
+        delta_azimuth = delta_azimuth if delta_azimuth <= 180 else delta_azimuth - 360
+        delta_azimuth = delta_azimuth if delta_azimuth >= -180 else delta_azimuth + 360
+        delta_radius = radius - opt.default_radius
+        
+        return RandCameraInfo(
+            uid=uid_offset,
+            R=R, T=T, FovY=FovY, FovX=FovX,
+            width=image_w, height=image_h,
+            delta_polar=delta_polar,
+            delta_azimuth=delta_azimuth,
+            delta_radius=delta_radius,
+            c2w=pose.numpy()
+        )
+    
+    spherical_coords = []
+    
+    for i in range(size):
+        phi, theta = sphere_hammersley_sequence(i, size)
+        spherical_coords.append((phi, theta))
+    
+    result = {}
+       
+    # Generate object-specific cameras
+    if obj_azimuth_adjustments:
+        result['objects'] = {}
+        for obj_idx, azimuth_offset in obj_azimuth_adjustments.items():
+            result['objects'][obj_idx] = {}
+            
+            # Radius = 2 cameras
+            obj_cameras_r2 = []
+            for i, (phi, theta) in enumerate(spherical_coords):
+                cam_info = create_camera_from_spherical(
+                    phi, theta, 4.0,
+                    uid_offset=i,  # Unique UID scheme
+                    azimuth_adjustment=azimuth_offset
+                )
+                obj_cameras_r2.append(cam_info)
+            result['objects'][obj_idx]['gt'] = obj_cameras_r2
+            
+            # Radius = 4 cameras
+            obj_cameras_r4 = []
+            for i, (phi, theta) in enumerate(spherical_coords):
+                cam_info = create_camera_from_spherical(
+                    phi, theta, 4.0,
+                    uid_offset=i,  # Unique UID scheme
+                    azimuth_adjustment=0
+                )
+                obj_cameras_r4.append(cam_info)
+            result['objects'][obj_idx]['pred'] = obj_cameras_r4
+    
+    # Generate edge-specific cameras
+    if edge_azimuth_adjustments:
+        result['edges'] = {}
+        for edge_idx, azimuth_offset in edge_azimuth_adjustments.items():
+            result['edges'][edge_idx] = {}
+            
+            # Radius = 2 cameras
+            edge_cameras_r2 = []
+            for i, (phi, theta) in enumerate(spherical_coords):
+                cam_info = create_camera_from_spherical(
+                    phi, theta, 4.0,
+                    uid_offset=i,  # Unique UID scheme
+                    azimuth_adjustment=azimuth_offset
+                )
+                edge_cameras_r2.append(cam_info)
+            result['edges'][edge_idx]['gt'] = edge_cameras_r2
+            
+            # Radius = 4 cameras
+            edge_cameras_r4 = []
+            for i, (phi, theta) in enumerate(spherical_coords):
+                cam_info = create_camera_from_spherical(
+                    phi, theta, 4.0,
+                    uid_offset=i,  # Unique UID scheme
+                    azimuth_adjustment=0
+                )
+                edge_cameras_r4.append(cam_info)
+            result['edges'][edge_idx]['pred'] = edge_cameras_r4
+    
+    return result
 
 sceneLoadTypeCallbacks = {
     "RandomCam": readCircleCamInfo
