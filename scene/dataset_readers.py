@@ -25,7 +25,10 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from utils.general_utils import inverse_sigmoid_np
 from scene.gaussian_model import BasicPointCloud
-
+import utils3d
+from scipy.spatial.transform import Rotation as R
+from trellis.representations.gaussian import Gaussian
+from LGM.gaussian_model import GaussianRenderer
 
 class RandCameraInfo(NamedTuple):
     uid: int
@@ -40,6 +43,13 @@ class RandCameraInfo(NamedTuple):
     delta_radius: np.array
     c2w: np.array
 
+
+class TrellisGaussians(NamedTuple):
+    xyz: torch.Tensor
+    features_dc: torch.Tensor
+    scaling: torch.Tensor
+    rotation: torch.Tensor
+    opacity: torch.Tensor
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -153,9 +163,19 @@ def rotate_point_cloud(point_cloud, angles):
     rotation_matrix = rotation_z @ rotation_y @ rotation_x
 
     # Apply the rotation matrix to the point cloud
+    if isinstance(point_cloud, torch.Tensor):
+        point_cloud = point_cloud.cpu().numpy()
     return np.dot(point_cloud, rotation_matrix.T)
 
-# only test_camera
+def zero_pad_tensor(tensor_list, pad_size, num_objs):
+    x = list(tensor_list[0].shape)
+    x[0] = pad_size
+    for i in range(num_objs):
+        xyz_pad = torch.zeros((x), device=tensor_list[i].device, dtype=tensor_list[i].dtype)
+        xyz_pad[:tensor_list[i].shape[0]] = tensor_list[i]
+        tensor_list[i] = xyz_pad
+    
+    return torch.cat(tensor_list, dim=0)
 
 
 def readCircleCamInfo(path, opt):
@@ -166,8 +186,9 @@ def readCircleCamInfo(path, opt):
     volumes_path = os.path.join(path, "inint_points3d_volume.npy")
     num_pts = opt.init_num_pts
     num_objs = opt.num_objs
+    reinit = opt.init_shape == "mix"
 
-    if not os.path.exists(ply_path) or not os.path.exists(lengths_path) or not os.path.exists(volumes_path):
+    if reinit or not os.path.exists(ply_path) or not os.path.exists(lengths_path) or not os.path.exists(volumes_path):
         # Since this data set has no colmap data, we start with random points
         points = num_pts // num_objs
         if opt.init_shape == 'sphere':
@@ -287,6 +308,197 @@ def readCircleCamInfo(path, opt):
             num_pts = num_objs * lengths[0]
             xyz = np.array(xyz)
             rgb = np.array(rgb)
+        elif opt.init_shape == 'trellis':
+            init_xyz = []
+            init_features_dc = []
+            init_scaling = []
+            init_rotation = []
+            init_opacity = []
+            lengths = []
+
+            for i in range(num_objs):
+                num_pts = int(points/5000) * 4096
+                
+                # Initialize helper class
+                data = Gaussian(
+                    sh_degree=0,
+                    aabb=[-0.5, -0.5, -0.5, 1.0, 1.0, 1.0],
+                    mininum_kernel_size = 9e-4,
+                    scaling_bias = 4e-3,
+                    opacity_bias = 0.1,
+                    scaling_activation = "softplus"
+                )
+
+                # Load the point cloud
+                data.load_ply(opt.init_prompt[int(i)], num_pts)
+                
+                # --- 1. PREPARE PARAMS ---
+                scale_val = opt.radius_params[i]
+                center_val = opt.center_params[i]
+                # rotate_point_cloud expects (x, y, z) angles
+                angles = (opt.rotate_angles[i][0], opt.rotate_angles[i][1], opt.rotate_angles[i][2])
+
+                # --- 2. TRANSFORM POSITIONS (XYZ) ---
+                # Rotate positions (returns numpy)
+                xyz_np = rotate_point_cloud(data._xyz, angles)
+                # Scale positions (spread points apart) + Translate
+                xyz_np = xyz_np * scale_val + center_val
+
+                # --- 3. TRANSFORM SCALES (SIZE) ---
+                # We must scale the size of the gaussians, otherwise they look like tiny dots.
+                # We get the linear scale, multiply it, and re-encode it to hidden format.
+                current_scales = data.get_scaling # Returns linear scales (not log)
+                new_scales = current_scales * scale_val
+                
+                # Re-encode back to storage format (inverse softplus or log)
+                if data.scaling_activation == "softplus":
+                    hidden_scales = torch.log(torch.exp(new_scales) - 1 + 1e-6)
+                else: 
+                    hidden_scales = torch.log(new_scales + 1e-6)
+
+                # --- 4. TRANSFORM ROTATIONS (ORIENTATION) ---
+                # We must rotate the individual gaussians so they face the right way.
+                # Construct the rotation matrix R_global matching 'rotate_point_cloud' logic (Z@Y@X)
+                ax, ay, az = angles
+                Rx = np.array([[1, 0, 0], [0, np.cos(ax), -np.sin(ax)], [0, np.sin(ax), np.cos(ax)]])
+                Ry = np.array([[np.cos(ay), 0, np.sin(ay)], [0, 1, 0], [-np.sin(ay), 0, np.cos(ay)]])
+                Rz = np.array([[np.cos(az), -np.sin(az), 0], [np.sin(az), np.cos(az), 0], [0, 0, 1]])
+                R_global = torch.tensor(Rz @ Ry @ Rx, dtype=torch.float32, device=data.device)
+
+                # Convert Quaternions -> Matrix -> Apply Transform -> Quaternions
+                qs = data._rotation
+                Rs_local = utils3d.torch.quaternion_to_matrix(qs)
+                Rs_new = torch.matmul(R_global.unsqueeze(0), Rs_local) # Broadcast global rot over all local rots
+                new_rotations = utils3d.torch.matrix_to_quaternion(Rs_new)
+
+                # --- 5. STORE ---
+                init_xyz.append(torch.tensor(xyz_np, dtype=torch.float32, device=data.device))
+                init_features_dc.append(data._features_dc)
+                init_scaling.append(hidden_scales)
+                init_rotation.append(new_rotations)
+                init_opacity.append(data._opacity)
+                lengths.append(xyz_np.shape[0])
+            print(lengths)
+
+            # Concatenate all attributes
+            # init_xyz = torch.cat(init_xyz, dim=0)
+            # init_features_dc = torch.cat(init_features_dc, dim=0)
+            # init_scaling = torch.cat(init_scaling, dim=0)
+            # init_rotation = torch.cat(init_rotation, dim=0)
+            # init_opacity = torch.cat(init_opacity, dim=0)
+            init_xyz = zero_pad_tensor(init_xyz, pad_size=max(lengths), num_objs=num_objs)
+            init_features_dc = zero_pad_tensor(init_features_dc, pad_size=max(lengths), num_objs=num_objs)
+            init_scaling = zero_pad_tensor(init_scaling, pad_size=max(lengths), num_objs=num_objs)
+            init_rotation = zero_pad_tensor(init_rotation, pad_size=max(lengths), num_objs=num_objs)
+            init_opacity = zero_pad_tensor(init_opacity, pad_size=max(lengths), num_objs=num_objs)
+            volumes = None
+
+            pcd = TrellisGaussians(
+                xyz=init_xyz.clone().detach().cpu(),
+                features_dc=init_features_dc.clone().detach().cpu(),
+                scaling=init_scaling.clone().detach().cpu(),
+                rotation=init_rotation.clone().detach().cpu(),
+                opacity=init_opacity.clone().detach().cpu()
+            )
+        elif opt.init_shape == 'LGM':
+            init_xyz = []
+            init_features_dc = []
+            init_scaling = []
+            init_rotation = []
+            init_opacity = []
+            lengths = []
+
+            # Initialize the renderer once to access the load_ply method
+            renderer = GaussianRenderer(opt)
+
+            for i in range(num_objs):
+                # Use the specified number of points from params or default calculation
+                num_pts = opt.init_num_pts # Or keep your int(points/5000)*4096 logic
+                
+                # Load dictionary from LGM renderer
+                # Returns keys: 'means3D', 'opacity', 'scales', 'rotations', 'shs'
+                data_dict = renderer.load_ply(opt.init_prompt[int(i)], num_pts)
+                
+                # Extract Tensors (on GPU)
+                means3D = data_dict["means3D"]
+                scales = data_dict["scales"]       # Linear scale (because we used compatible=True)
+                rotations = data_dict["rotations"] # Quaternions [w, x, y, z] or [x, y, z, w] depending on lib
+                opacity = data_dict["opacity"]     # Linear opacity [0-1]
+                shs = data_dict["shs"]             # RGB/SH features
+
+                # --- 1. PREPARE PARAMS ---
+                scale_val = opt.radius_params[i]
+                center_val = torch.tensor(opt.center_params[i], device=means3D.device, dtype=torch.float32)
+                angles = (opt.rotate_angles[i][0], opt.rotate_angles[i][1], opt.rotate_angles[i][2])
+
+                # --- 2. TRANSFORM POSITIONS (XYZ) ---
+                # Convert to numpy for rotate_point_cloud if strictly required, 
+                # otherwise standard PyTorch matrix multiplication is preferred.
+                # Assuming rotate_point_cloud takes numpy:
+                xyz_np = means3D.detach().cpu().numpy()
+                xyz_np = rotate_point_cloud(xyz_np, angles)
+                
+                # Convert back to tensor for scaling/translation
+                xyz_tensor = torch.tensor(xyz_np, dtype=torch.float32, device=means3D.device)
+                xyz_tensor = xyz_tensor * scale_val + center_val
+
+                # --- 3. TRANSFORM SCALES (SIZE) ---
+                # LGM loaded scales are linear. We multiply by the object scale.
+                new_scales = scales * scale_val
+                
+                # Convert to "Hidden" Log-Space for GaussianModel storage
+                # (Standard 3DGS optimization stores log-scales)
+                hidden_scales = torch.log(new_scales + 1e-8)
+
+                # --- 4. TRANSFORM ROTATIONS (ORIENTATION) ---
+                # Construct Global Rotation Matrix (Z@Y@X)
+                ax, ay, az = angles
+                Rx = np.array([[1, 0, 0], [0, np.cos(ax), -np.sin(ax)], [0, np.sin(ax), np.cos(ax)]])
+                Ry = np.array([[np.cos(ay), 0, np.sin(ay)], [0, 1, 0], [-np.sin(ay), 0, np.cos(ay)]])
+                Rz = np.array([[np.cos(az), -np.sin(az), 0], [np.sin(az), np.cos(az), 0], [0, 0, 1]])
+                R_global = torch.tensor(Rz @ Ry @ Rx, dtype=torch.float32, device=means3D.device)
+
+                # Rotate Quaternions: Quat -> Mat -> MatMul -> Quat
+                # Ensure utils3d matches your library (e.g. pytorch3d)
+                Rs_local = utils3d.torch.quaternion_to_matrix(rotations)
+                Rs_new = torch.matmul(R_global.unsqueeze(0), Rs_local) 
+                new_rotations = utils3d.torch.matrix_to_quaternion(Rs_new)
+
+                # --- 5. STORE ---
+                init_xyz.append(xyz_tensor)
+                
+                # Handle Feature Dimensions: LGM is [N, 3], 3DGS often wants [N, 1, 3] for DC
+                if shs.dim() == 2:
+                    shs = shs.unsqueeze(1)
+                init_features_dc.append(shs)
+                
+                init_scaling.append(hidden_scales)
+                init_rotation.append(new_rotations)
+                
+                # Handle Opacity: Convert linear opacity back to logits (inverse sigmoid) for storage
+                # This allows the optimizer to apply sigmoid() during forward pass
+                hidden_opacity = kiui.op.inverse_sigmoid(opacity) 
+                init_opacity.append(hidden_opacity)
+                
+                lengths.append(xyz_tensor.shape[0])
+
+            print(f"Initialized LGM Objects with point counts: {lengths}")
+            
+            # Pad and stack
+            init_xyz = zero_pad_tensor(init_xyz, pad_size=max(lengths), num_objs=num_objs)
+            init_features_dc = zero_pad_tensor(init_features_dc, pad_size=max(lengths), num_objs=num_objs)
+            init_scaling = zero_pad_tensor(init_scaling, pad_size=max(lengths), num_objs=num_objs)
+            init_rotation = zero_pad_tensor(init_rotation, pad_size=max(lengths), num_objs=num_objs)
+            init_opacity = zero_pad_tensor(init_opacity, pad_size=max(lengths), num_objs=num_objs)
+            volumes = None
+
+            pcd = TrellisGaussians(
+                xyz=init_xyz.clone().detach().cpu(),
+                features_dc=init_features_dc.clone().detach().cpu(),
+                scaling=init_scaling.clone().detach().cpu(),
+                rotation=init_rotation.clone().detach().cpu(),
+                opacity=init_opacity.clone().detach().cpu()
+            )
         elif opt.init_shape == 'scene':
             thetas = np.random.rand(num_pts)*np.pi
             phis = np.random.rand(num_pts)*2*np.pi
@@ -309,19 +521,29 @@ def readCircleCamInfo(path, opt):
             storePly(ply_path, xyz, rgb * 255)
             np.save(lengths_path, np.array(lengths))
             np.save(volumes_path, np.array(volumes))
+        elif opt.init_shape == "trellis":
+            pcd = pcd
+            np.save(lengths_path, np.array(lengths))
+            np.save(volumes_path, np.array(volumes))
         else:
             pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
                 shs), normals=np.zeros((num_objs, num_pts // num_objs, 3)))
             storePly(ply_path, np.vstack(xyz), np.vstack(SH2RGB(shs) * 255))
             np.save(lengths_path, np.array(lengths))
             np.save(volumes_path, np.array(volumes))
-    try:
-        pcd = fetchPly(ply_path, num_objs)
+
+    if opt.init_shape != 'trellis':
+        try:
+            pcd = fetchPly(ply_path, num_objs)
+            lengths = np.load(lengths_path).tolist()
+            volumes = np.load(volumes_path).tolist()
+        except:
+            pcd = None
+            lengths = None
+            volumes = None
+    else:
         lengths = np.load(lengths_path).tolist()
-        volumes = np.load(volumes_path).tolist()
-    except:
-        pcd = None
-        lengths = None
+        pcd = pcd
         volumes = None
 
     scene_info = GraphSceneInfo(point_cloud=pcd,
@@ -330,6 +552,7 @@ def readCircleCamInfo(path, opt):
                                 volumes=volumes,
                                 test_cameras=test_cam_infos,
                                 ply_path=ply_path)
+
     return scene_info
 
 def safe_normalize(x, eps=1e-20):
@@ -619,7 +842,7 @@ def GenerateRandomCameras(opt, size=2000, cam_scale=1.0, SSAA=True):
     delta_polar = thetas - opt.default_polar
     delta_azimuth = phis - opt.default_azimuth
     delta_azimuth[delta_azimuth > 180] -= 360  # range in [-180, 180]
-    delta_radius = radius - opt.default_radius * cam_scale
+    delta_radius = radius - opt.default_radius
     # print(radius, delta_radius, opt.radius_range, [x * cam_scale for x in opt.radius_range])
     # random focal
     # fovy_range = get_dynamic_fovy_range(opt.fovy_range, cam_scale)
@@ -654,20 +877,21 @@ def GenerateRandomCameras(opt, size=2000, cam_scale=1.0, SSAA=True):
                                         delta_azimuth=delta_azimuth[idx], delta_radius=delta_radius[idx], c2w=poses[idx]))
     return cam_infos
 
-def GenerateCameraAtZeroAzimuth(opt, SSAA=True):
+def GenerateCameraAtZeroAzimuth(opt, radius_range, SSAA=True):
     # Generate a single pose at 0-degree azimuth
     size = 4  # Only one camera
     fixed_azimuth = 90  # Azimuth at 0 degrees
     
+
     # Generate a pose with fixed azimuth
     poses, thetas, phis, radius = rand_poses_orthogonal(
-        size, opt, 
-        radius_range=opt.radius_range, 
-        theta_range=opt.theta_range, 
+        size, opt,
+        radius_range=radius_range,
+        theta_range=opt.theta_range,
         phi_range=(fixed_azimuth, fixed_azimuth),  # Force azimuth to 0 degrees
-        angle_overhead=opt.angle_overhead, 
-        angle_front=opt.angle_front, 
-        uniform_sphere_rate=opt.uniform_sphere_rate, 
+        angle_overhead=0,
+        angle_front=opt.angle_front,
+        uniform_sphere_rate=opt.uniform_sphere_rate,
         rand_cam_gamma=opt.rand_cam_gamma
     )
 
@@ -734,7 +958,7 @@ def GenerateSphericalCameras(opt, size=150, obj_azimuth_adjustments=None, edge_a
     """
     Generate cameras using spherical Hammersley sequence with different radius parameters
     and azimuth adjustments for objects and edges.
-    
+
     Args:
         opt: Options containing camera parameters
         size: Number of base cameras to generate (default 150)
@@ -742,7 +966,7 @@ def GenerateSphericalCameras(opt, size=150, obj_azimuth_adjustments=None, edge_a
         obj_azimuth_adjustments: Dict {obj_idx: azimuth_offset} for objects
         edge_azimuth_adjustments: Dict {edge_idx: azimuth_offset} for edges
         SSAA: Whether to apply super sampling
-    
+
     Returns:
         Dictionary containing different camera sets
     """
@@ -750,68 +974,68 @@ def GenerateSphericalCameras(opt, size=150, obj_azimuth_adjustments=None, edge_a
 
     if obj_azimuth_adjustments is None:
         obj_azimuth_adjustments = {}
-        
+
     if edge_azimuth_adjustments is None:
         edge_azimuth_adjustments = {}
-    
+
     # SSAA settings
     if SSAA:
         ssaa = opt.SSAA
     else:
         ssaa = 1
-    
+
     image_h = opt.image_h * ssaa
     image_w = opt.image_w * ssaa
-    
+
     # Random focal length
     fov = random.random() * (opt.fovy_range[1] - opt.fovy_range[0]) + opt.fovy_range[0]
-    
+
     def create_camera_from_spherical(phi, theta, radius, uid_offset=0, azimuth_adjustment=0):
         """Create camera info from spherical coordinates"""
         # Adjust azimuth
         phi_adjusted = phi + np.radians(azimuth_adjustment)
-        
+
         # Convert spherical to Cartesian
         x = radius * np.cos(theta) * np.cos(phi_adjusted)
         y = radius * np.cos(theta) * np.sin(phi_adjusted)
         z = radius * np.sin(theta)
-        
+
         # Create pose matrix
         center = torch.tensor([x, y, z], dtype=torch.float32)
         target = torch.zeros(3, dtype=torch.float32)
-        
+
         # Look-at vectors
         forward_vector = safe_normalize((center - target).unsqueeze(0))
         up_vector = torch.tensor([[0, 0, 1]], dtype=torch.float32)
         right_vector = safe_normalize(torch.cross(forward_vector, up_vector, dim=-1))
         up_vector = safe_normalize(torch.cross(right_vector, forward_vector, dim=-1))
-        
+
         # Create pose matrix
         pose = torch.eye(4, dtype=torch.float32)
         pose[:3, :3] = torch.stack([-right_vector[0], up_vector[0], forward_vector[0]], dim=-1)
         pose[:3, 3] = center
-        
+
         # Convert to camera parameters
         matrix = np.linalg.inv(pose.numpy())
         R = -np.transpose(matrix[:3, :3])
         R[:, 0] = -R[:, 0]
         T = -matrix[:3, 3]
-        
+
         # Calculate FOV
         fovy = focal2fov(fov2focal(fov, image_h), image_w)
         FovY = fovy
         FovX = fov
-        
+
         # Calculate deltas for compatibility
         theta_deg = np.degrees(theta)
         phi_deg = np.degrees(phi_adjusted)
-        
+
         delta_polar = theta_deg - opt.default_polar
         delta_azimuth = phi_deg - opt.default_azimuth
         delta_azimuth = delta_azimuth if delta_azimuth <= 180 else delta_azimuth - 360
         delta_azimuth = delta_azimuth if delta_azimuth >= -180 else delta_azimuth + 360
         delta_radius = radius - opt.default_radius
-        
+
         return RandCameraInfo(
             uid=uid_offset,
             R=R, T=T, FovY=FovY, FovX=FovX,
@@ -821,71 +1045,71 @@ def GenerateSphericalCameras(opt, size=150, obj_azimuth_adjustments=None, edge_a
             delta_radius=delta_radius,
             c2w=pose.numpy()
         )
-    
+
     spherical_coords = []
-    
+
     for i in range(size):
         phi, theta = sphere_hammersley_sequence(i, size)
         spherical_coords.append((phi, theta))
-    
+
     result = {}
-       
+
     # Generate object-specific cameras
     if obj_azimuth_adjustments:
         result['objects'] = {}
         for obj_idx, azimuth_offset in obj_azimuth_adjustments.items():
             result['objects'][obj_idx] = {}
-            
+
             # Radius = 2 cameras
             obj_cameras_r2 = []
             for i, (phi, theta) in enumerate(spherical_coords):
                 cam_info = create_camera_from_spherical(
-                    phi, theta, 4.0,
+                    phi, theta, 3.5,
                     uid_offset=i,  # Unique UID scheme
                     azimuth_adjustment=azimuth_offset
                 )
                 obj_cameras_r2.append(cam_info)
             result['objects'][obj_idx]['gt'] = obj_cameras_r2
-            
+
             # Radius = 4 cameras
             obj_cameras_r4 = []
             for i, (phi, theta) in enumerate(spherical_coords):
                 cam_info = create_camera_from_spherical(
-                    phi, theta, 4.0,
+                    phi, theta, 3.5,
                     uid_offset=i,  # Unique UID scheme
                     azimuth_adjustment=0
                 )
                 obj_cameras_r4.append(cam_info)
             result['objects'][obj_idx]['pred'] = obj_cameras_r4
-    
+
     # Generate edge-specific cameras
     if edge_azimuth_adjustments:
         result['edges'] = {}
         for edge_idx, azimuth_offset in edge_azimuth_adjustments.items():
             result['edges'][edge_idx] = {}
-            
+
             # Radius = 2 cameras
             edge_cameras_r2 = []
             for i, (phi, theta) in enumerate(spherical_coords):
                 cam_info = create_camera_from_spherical(
-                    phi, theta, 4.0,
+                    phi, theta, 3.5,
                     uid_offset=i,  # Unique UID scheme
                     azimuth_adjustment=azimuth_offset
                 )
                 edge_cameras_r2.append(cam_info)
             result['edges'][edge_idx]['gt'] = edge_cameras_r2
-            
+
             # Radius = 4 cameras
             edge_cameras_r4 = []
             for i, (phi, theta) in enumerate(spherical_coords):
                 cam_info = create_camera_from_spherical(
-                    phi, theta, 4.0,
+                    phi, theta, 3.5,
                     uid_offset=i,  # Unique UID scheme
                     azimuth_adjustment=0
                 )
                 edge_cameras_r4.append(cam_info)
             result['edges'][edge_idx]['pred'] = edge_cameras_r4
-    
+
     return result
 
 sceneLoadTypeCallbacks = {

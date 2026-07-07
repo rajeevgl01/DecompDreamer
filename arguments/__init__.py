@@ -154,8 +154,8 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.feature_lr_final = 0.0030
-        self.pos_delta_lr_init = 0.0079
-        self.pos_delta_lr_final = 0.000016
+        self.pos_delta_lr_init = 0
+        self.pos_delta_lr_final = 0
 
         self.opacity_lr = 0.025
         self.scaling_lr = 0.005

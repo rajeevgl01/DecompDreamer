@@ -358,7 +358,7 @@ class StableDiffusion(nn.Module):
                                         pred_x0_sp, pred_x0_pos], dim=0)
                 save_image(viz_images, save_path_iter)
 
-        return loss
+        return loss, torch.mean(F.mse_loss(pred_noise, target) * (w(self.alphas[t])**2)).detach()
 
     def train_step(self, text_embeddings, pred_rgb,
                    grad_scale=1, use_control_net=False,

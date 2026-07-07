@@ -163,8 +163,8 @@ class StableDiffusion(nn.Module):
 
         grad = torch.nan_to_num(grad_scale * grad)
         loss = SpecifyGradient.apply(latents, grad)
-        return loss
-
+        return loss, torch.mean(F.mse_loss(pred_noise, target) * (sigma**2)).detach()
+    
     def train_step(self, text_embeddings, pooled_text_embeddings, pred_rgb, control_image=None,
                    grad_scale=1, use_control_net=False,
                    save_folder: Path = None, iteration=0, warm_up_rate=0, weights=0,

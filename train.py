@@ -23,6 +23,7 @@ import numpy as np
 import datetime
 from omegaconf import OmegaConf
 
+
 try:
 	from torch.utils.tensorboard import SummaryWriter
 	TENSORBOARD_FOUND = True
@@ -164,7 +165,7 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 			print('scale up radius_range to:', scene.pose_args.radius_range)
 			print('scale up phi_range to:', scene.pose_args.phi_range)
 			print('scale up fovy_range to:', scene.pose_args.fovy_range)
-	
+
 	if len(objs) == 1:
 		cam_scale = gcams.radius_params[objs[0]]
 	elif len(objs) == 2:
@@ -234,7 +235,7 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 							bg_aug_ratio=dataset.bg_aug_ratio,
 							shs_aug_ratio=dataset.shs_aug_ratio,
 							scale_aug_ratio=dataset.scale_aug_ratio,
-							scaling_modifier=cam_scale)
+							object_scale=cam_scale)
 		image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[
 			"viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -243,7 +244,7 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 		# to_pil = T.ToPILImage()
 		# save = to_pil(image)
 		# save.save(f"out_{iteration}_{i}_{len(objs)}_without.png")
-		
+
 		viewpoint_cams.append(viewpoint_cams)
 
 	images = torch.stack(images, dim=0)
@@ -257,7 +258,7 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 	train_step_fn = guidance.train_step_perpneg if guidance_opt.perpneg else guidance.train_step
 	weights = torch.stack(weights_, dim=1) if guidance_opt.perpneg else None
 
-	loss = train_step_fn(
+	loss, actual_loss = train_step_fn(
 		text_embeddings=torch.stack(text_z_, dim=1),
 		pooled_text_embeddings=torch.stack(text_z_pooled_, dim=1),
 		pred_rgb=images,
@@ -276,7 +277,7 @@ def forward(opt, embeddings, objs, azimuth_offset, iteration, viewpoint_stack, s
 	loss_scale = torch.mean(scales, dim=-1).mean()
 	loss_tv = tv_loss(images)
 	loss = loss + opt.lambda_tv * loss_tv + opt.lambda_scale * loss_scale
-	return loss, image, viewspace_point_tensor, visibility_filter, radii
+	return loss, actual_loss, image, viewspace_point_tensor, visibility_filter, radii
 
 
 def weighting_function(current_iter, total_iters, num_objs, method="linear"):
@@ -288,9 +289,8 @@ def weighting_function(current_iter, total_iters, num_objs, method="linear"):
 	current_iter = current_iter // num_objs
 	total_iters = total_iters // num_objs
 	progress = current_iter / (total_iters / 2)
-	
-	return 2 * torch.tensor(progress)**2
 
+	return 2 * torch.tensor(progress)**2
 
 def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, save_video, cfg):
 	first_iter = 0
@@ -447,10 +447,11 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 			if operation == 'edge':
 				full_scene = False
 				edge = edges[edge_index]
-				edge_loss, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
+				edge_loss, actual_edge_loss, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
 																							embeddings=edge_embeddings[str(
 																								edge)], objs=edge, azimuth_offset=azimuth_offsets[str(edge)], **kwargs)
-				wandb.log({"loss/edge_loss": edge_loss.item()})
+				wandb.log({f"loss/{edge}/edge_loss": edge_loss.item()})
+				wandb.log({f"loss/{edge}/actual_edge_loss": actual_edge_loss.item()})
 				obj_weight = weighting_function(iteration,
 											opt.iterations, num_objs, "quadratic")
 				loss = edge_loss
@@ -460,9 +461,9 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 				radiis = [radii]
 				edge = random.sample(edge, 2)
 				for obj in edge:
-					obj_loss, _, viewspace_point_tensor_obj, visibility_filter_obj, radii_obj = forward(opt,
+					obj_loss, actual_obj_loss, _, viewspace_point_tensor_obj, visibility_filter_obj, radii_obj = forward(opt,
 																										embeddings=obj_embeddings[obj], objs=[obj], azimuth_offset=azimuth_offsets[str(obj)], **kwargs)
-					if opt.size_lambda:
+					if opt.size_lambda and opt.num_objs == 6:
 						size_loss = gaussians.get_volume_loss(obj, gt_volumes[obj])
 						wandb.log({"loss/obj_size_loss": size_loss.item()})
 						loss += obj_weight * obj_loss + float(opt.size_lambda) * (1 - (iteration // num_objs) / (opt.iterations // num_objs)) * size_loss
@@ -472,12 +473,13 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 					vpt += [viewspace_point_tensor_obj]
 					vf += [visibility_filter_obj]
 					radiis += [radii_obj]
-					wandb.log({"loss/obj_loss": obj_loss.item()})
+					wandb.log({f"loss/{obj}/obj_loss": obj_loss.item()})
+					wandb.log({f"loss/{obj}/actual_obj_loss": actual_obj_loss.item()})
 			else:
 				random.shuffle(edges)
 				full_scene = True
 				# full scene rendering
-				loss, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
+				loss,_, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
 																						embeddings=embeddings, objs=idx_list, azimuth_offset=azimuth_offsets['global'], **kwargs)
 				selected_objs = idx_list
 		else:
@@ -485,18 +487,19 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 				full_scene = False
 				edge = edges[edge_index]
 				obj = edge[obj_index]
-				edge_loss, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
+				edge_loss, actual_edge_loss, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
 																								embeddings=edge_embeddings[str(
 																									edge)], objs=edge, azimuth_offset=azimuth_offsets[str(edge)], **kwargs)
-				wandb.log({"loss/edge_loss": edge_loss.item()})
+				wandb.log({f"loss/{edge}/edge_loss": edge_loss.item()})
+				wandb.log({f"loss/{edge}/actual_edge_loss": actual_edge_loss.item()})
 				loss = edge_loss
 				selected_objs = [edge]
 				vpt = [viewspace_point_tensor]
 				vf = [visibility_filter]
 				radiis = [radii]
-				obj_loss, _, viewspace_point_tensor_obj, visibility_filter_obj, radii_obj = forward(opt,
+				obj_loss, actual_obj_loss, _, viewspace_point_tensor_obj, visibility_filter_obj, radii_obj = forward(opt,
 																									embeddings=obj_embeddings[obj], objs=[
-																										obj], azimuth_offset=azimuth_offsets[str(obj)], **kwargs)																										
+																										obj], azimuth_offset=azimuth_offsets[str(obj)], **kwargs)
 				if opt.size_lambda and opt.num_objs == 6:
 					size_loss = gaussians.get_volume_loss(obj, gt_volumes[obj])
 					wandb.log({"loss/obj_size_loss": size_loss.item()})
@@ -508,19 +511,20 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 				vpt += [viewspace_point_tensor_obj]
 				vf += [visibility_filter_obj]
 				radiis += [radii_obj]
-				wandb.log({"loss/obj_loss": obj_loss.item()})
+				wandb.log({f"loss/{obj}/obj_loss": obj_loss.item()})
+				wandb.log({f"loss/{obj}/actual_obj_loss": actual_obj_loss.item()})
 			else:
 				random.shuffle(edges)
 				full_scene = True
 				# full scene rendering
-				loss, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
+				loss, actual_loss, image, viewspace_point_tensor, visibility_filter, radii = forward(opt,
 																						embeddings=embeddings, objs=idx_list, azimuth_offset=azimuth_offsets['global'], **kwargs)
 				selected_objs = idx_list
 
 		wandb.log({"loss/graph_loss": loss.item()})
+
 		if stage == 2:
 			previous_state = gaussians.capture()
-
 		loss.backward()
 		iter_end.record()
 
@@ -545,21 +549,20 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 			if iteration == opt.iterations:
 				progress_bar.close()
 
-			# Log and save
-			training_report(tb_writer, iteration, iter_start.elapsed_time(
-				iter_end), testing_iterations, scene, render, (pipe, background, idx_list))
-			if (iteration in testing_iterations):
-				idx_list = [1, 2]
-				if save_video:
-					video_inference(iteration, scene, render,
-									(pipe, background, idx_list), tb_writer)
-					for i in range(num_objs):
-						video_inference_obj(
-							iteration, scene, render_obj, (pipe, background, i), i, tb_writer)
+			# # Log and save
+			# training_report(tb_writer, iteration, iter_start.elapsed_time(
+			# 	iter_end), testing_iterations, scene, render, (pipe, background, idx_list))
+			# if (iteration in testing_iterations):
+			# 	if save_video:
+			# 		video_inference(iteration, scene, render,
+			# 						(pipe, background, idx_list), tb_writer)
+			# 		for i in range(num_objs):
+			# 			video_inference_obj(
+			# 				iteration, scene, render_obj, (pipe, background, i), i, tb_writer)
 
-			if (iteration in saving_iterations):
-				print("\n[ITER {}] Saving Gaussians".format(iteration))
-				scene.save(iteration)
+			# if (iteration in saving_iterations):
+			# 	print("\n[ITER {}] Saving Gaussians".format(iteration))
+			# 	scene.save(iteration)
 
 			# Densification
 			if iteration < opt.densify_until_iter:
@@ -592,7 +595,7 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 			if iteration < opt.iterations:
 				gaussians.optimizer.step()
 				gaussians.optimizer.zero_grad(set_to_none=True)
-			
+
 			if stage == 2 and operation == 'edge':
 				gaussians.reinit_from_state_dict(previous_state, obj)
 
@@ -747,7 +750,7 @@ if __name__ == "__main__":
 	parser.add_argument('--debug_from', type=int, default=-1)
 	parser.add_argument('--seed', type=int, default=0)
 	parser.add_argument('--detect_anomaly', action='store_true', default=False)
-	parser.add_argument("--test_ratio", type=int, default=50)
+	parser.add_argument("--test_ratio", type=int, default=5)
 	parser.add_argument("--save_ratio", type=int, default=2)
 	parser.add_argument("--save_video", type=bool, default=False)
 	parser.add_argument("--quiet", action="store_true")
